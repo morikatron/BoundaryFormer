@@ -1,4 +1,5 @@
 import math
+import copy
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -128,7 +129,6 @@ class UpsamplingDecoderLayer(nn.Module):
 
         self.register_buffer("point_embedding", point_encoding(self.model_dimension * 2, max_len=self.max_control_points))
         self.number_iterations = int(math.log2(self.max_control_points // self.base_control_points)) + 1
-        print("{0} to {1} over {2} layers".format(self.base_control_points, self.max_control_points, self.number_iterations))
 
         self.idxs = []
         for iter_idx in range(self.number_iterations):
@@ -186,51 +186,76 @@ class UpsamplingDecoderLayer(nn.Module):
         tgt = tgt.view(orig_batch_size, num_query, -1, dim_control)
         query_pos = query_pos.view(orig_batch_size, num_query, -1, dim_control)
         reference_points = reference_points.view(orig_batch_size, num_query, -1, num_lvl, 2)
-            
+
         insert_reference_points = insert_reference_points.view(orig_batch_size, num_query, -1, num_lvl, 2)
-            
+
         # needs to return what it changed.
         return self.inner(tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask, cls_token=cls_token, reference_boxes=reference_boxes)[0], (tgt, query_pos, insert_reference_points)
-    
+
+
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False, predict_in_box_space=False):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False, predict_in_box_space=False, num_layer_per_level=1):
         super().__init__()
 
-        self.layers = _get_clones(decoder_layer, num_layers)
+        self.layers = []
+        for _ in range(num_layers):
+            for ilyr in range(num_layer_per_level):
+                if ilyr == 0 or isinstance(decoder_layer, DeformableTransformerControlLayer):
+                    self.layers.append(copy.deepcopy(decoder_layer))
+                else:
+                    self.layers.append(copy.deepcopy(decoder_layer.inner))
+        self.layers = nn.ModuleList(self.layers)
+
         self.num_layers = num_layers
+        self.num_layer_per_level = num_layer_per_level
         self.return_intermediate = return_intermediate
         self.predict_in_box_space = predict_in_box_space
 
         # iterative refinement.
-        self.xy_embed = None        
+        self.xy_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None, cls_token=None, reference_boxes=None):
-        output = tgt
+                query_pos=None, src_padding_mask=None, cls_token=None, reference_boxes=None, is_residual=False, detach_each_level=False):
+        state = tgt
 
         intermediate = []
         intermediate_reference_points = []
-        for lid, layer in enumerate(self.layers):
+        for lid in range(self.num_layers):
+            layers = self.layers[lid*self.num_layer_per_level:(lid+1)*self.num_layer_per_level]
             if self.return_intermediate:
                 intermediate_reference_points.append(reference_points)
-            
+
             if reference_points.shape[-1] == 4:
                 # not supported
                 reference_points_input = reference_points[:, :, None] \
                                          * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
             else:
                 assert reference_points.shape[-1] == 2
-                reference_points_input = reference_points[:, :, :, None] * src_valid_ratios[:, None, None]                                        
+                reference_points_input = reference_points[:, :, :, None] * src_valid_ratios[:, None, None]  # e.g. [1, 15, 8, 1, 2] x [1, 1, 1, 4, 2] = [1, 15, 8, 4, 2], 8=num_points, 2=xy, 4 is duplicates
+                # NOTE Why 4 duplicates?
 
-            output, inserted = layer(
-                output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, lid, cls_token=cls_token, reference_boxes=reference_boxes)
-            
+            # Attention Layer
+            state_diff, inserted = layers[0](
+                state, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, lid, cls_token=cls_token, reference_boxes=reference_boxes)
+            for layer in layers[1:]:
+                state_diff, _ = layer(
+                    state_diff, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, lid, cls_token=cls_token, reference_boxes=reference_boxes)
+
+            # Residual Connect
+            if is_residual:
+                inserted_state = inserted[0] if inserted is not None else state
+                state = inserted_state + state_diff  # NOTE SEN: should be a residual output
+            else:
+                state = state_diff
+            if detach_each_level:
+                state = state.detach()
+
             if not (cls_token is None):
-                cls_token_tgt = output[:, -1]
+                cls_token_tgt = state_diff[:, -1]
 
                 # reunite it with the pos.
-                cls_token = torch.cat((cls_token[:, :cls_token_tgt.shape[-1]], cls_token_tgt), dim=-1)                
-                output = output[:, :-1]
+                cls_token = torch.cat((cls_token[:, :cls_token_tgt.shape[-1]], cls_token_tgt), dim=-1)
+                state_diff = state_diff[:, :-1]
 
             if not (inserted is None):
                 # note, we probably want the xy for the _first_ time a query appeared.
@@ -239,21 +264,24 @@ class DeformableTransformerDecoder(nn.Module):
 
                 max_instances = tgt.shape[1]
                 reference_points = torch.stack((reference_points, inserted_reference_points[:, :, :, 0]), dim=3).view(batch_size, max_instances, -1, 2)
-                intermediate_reference_points[-1] = reference_points 
+                intermediate_reference_points[-1] = reference_points
 
+            # NOTE By default, xy_embed is a list of (different) MLP, whose out dim is 2
             if self.xy_embed is not None:
-                tmp = self.xy_embed[lid](output)
-                    
+                xy_diff = self.xy_embed[lid](state_diff)  # [batch, instances, points, 2]
+
                 assert reference_points.shape[-1] == 2
-                new_reference_points = tmp + inverse_sigmoid(reference_points)
-                new_reference_points = new_reference_points.sigmoid()
+                new_reference_points = (xy_diff + inverse_sigmoid(reference_points)).sigmoid()
                 # unclear if detach() matters.
-                reference_points = new_reference_points #.detach()                
+                reference_points = new_reference_points
+            if detach_each_level:
+                reference_points = reference_points.detach()
 
             if self.return_intermediate:
-                intermediate.append(output)
+                intermediate.append(state_diff)
 
         if self.return_intermediate:
             return intermediate, intermediate_reference_points
 
-        return output, reference_points    
+        return state_diff, reference_points
+

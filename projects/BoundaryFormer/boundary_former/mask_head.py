@@ -1,12 +1,9 @@
-import copy
 import fvcore.nn.weight_init as weight_init
-import imageio
 import itertools
-import math
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+# This code is from https://github.com/mlpc-ucsd/BoundaryFormer
 from typing import List
 
 from detectron2.config import configurable
@@ -20,21 +17,24 @@ from detectron2.utils.registry import Registry
 from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 from torch.nn.utils.rnn import pad_sequence
 
-from boundary_former.diff_ras import MaskRasterizationLoss
-from boundary_former.layers.deform_attn import MSDeformAttn
-from boundary_former.poolers import MultiROIPooler
-from boundary_former.position_encoding import build_position_encoding
-from boundary_former.tensor import NestedTensor
-from boundary_former.transformer import DeformableTransformerDecoder, DeformableTransformerControlLayer, MLP, point_encoding, UpsamplingDecoderLayer
-from boundary_former.utils import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh, inverse_sigmoid, sample_ellipse_fast, POLY_LOSS_REGISTRY, _get_clones
+from .diff_ras import MaskRasterizationLoss
+from .layers.deform_attn import MSDeformAttn
+from .poolers import MultiROIPooler
+from .position_encoding import build_position_encoding
+from .tensor import NestedTensor
+from .transformer import DeformableTransformerDecoder, DeformableTransformerControlLayer, MLP, point_encoding, UpsamplingDecoderLayer
+from .utils import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh, inverse_sigmoid, sample_ellipse_fast, POLY_LOSS_REGISTRY, _get_clones
 
-@ROI_MASK_HEAD_REGISTRY.register()    
+
+@ROI_MASK_HEAD_REGISTRY.register()
 class BoundaryFormerPolygonHead(nn.Module):
     @configurable
     def __init__(self, input_shape: ShapeSpec, in_features, vertex_loss_fns, vertex_loss_ws, ref_init="ellipse",
                  model_dim=256, base_number_control_points=8, number_control_points=64, number_layers=4, vis_period=0,
                  is_upsampling=True, iterative_refinement=False, use_cls_token=False, use_p2p_attn=True, num_classes=80, cls_agnostic=False,
-                 predict_in_box_space=False, prepool=True, dropout=0.0, deep_supervision=True, **kwargs):
+                 predict_in_box_space=False, prepool=True, dropout=0.0, deep_supervision=True,
+                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, **kwargs
+                 ):
         """
         NOTE: this interface is experimental.
 
@@ -50,7 +50,7 @@ class BoundaryFormerPolygonHead(nn.Module):
 
         self.batch_size_div = 16
 
-        if not ref_init in ["ellipse", "random", "convex"]:
+        if ref_init not in ["ellipse", "random", "convex"]:
             raise ValueError("unknown ref_init {0}".format(ref_init))
 
         self.base_number_control_points = base_number_control_points
@@ -67,6 +67,8 @@ class BoundaryFormerPolygonHead(nn.Module):
         self.prepool = prepool
         self.dropout = dropout
         self.deep_supervision = deep_supervision
+        self.is_decoder_residual = is_decoder_residual
+        self.detach_each_level = detach_each_level
 
         self.vertex_loss_fns = []
         for loss_fn in vertex_loss_fns:
@@ -75,7 +77,7 @@ class BoundaryFormerPolygonHead(nn.Module):
 
             self.vertex_loss_fns.append(getattr(self, loss_fn_attr_name))
 
-        # add each as a module so it gets moved to the right device.        
+        # add each as a module so it gets moved to the right device.
         self.vertex_loss_ws = vertex_loss_ws
 
         if len(self.vertex_loss_fns) != len(self.vertex_loss_ws):
@@ -101,15 +103,15 @@ class BoundaryFormerPolygonHead(nn.Module):
                 nn.Linear(256, self.model_dimension),
                 nn.Linear(256, self.model_dimension),
                 nn.Linear(256, self.model_dimension),
-                nn.Linear(256, self.model_dimension),                        
+                nn.Linear(256, self.model_dimension),
             ])
         else:
             self.feature_proj = None
-                    
+
         activation = "relu"
         dec_n_points = 4
         nhead = 8
-        
+
         self.feedforward_dimension = 1024
         decoder_layer = DeformableTransformerControlLayer(
             self.model_dimension, self.feedforward_dimension, self.dropout, activation, self.num_feature_levels, nhead, dec_n_points,
@@ -119,20 +121,21 @@ class BoundaryFormerPolygonHead(nn.Module):
             decoder_layer = UpsamplingDecoderLayer(
                 self.model_dimension, self.base_number_control_points, self.number_control_points, decoder_layer)
             self.start_idxs = decoder_layer.idxs[0]
-            number_layers = decoder_layer.number_iterations # so we can get a final "layer".
+            number_layers = decoder_layer.number_iterations  # so we can get a final "layer".
             print(number_layers)
         else:
-            number_layers = self.num_layers
-            
-        self.decoder = DeformableTransformerDecoder(
-            decoder_layer, number_layers, return_intermediate=True, predict_in_box_space=self.predict_in_box_space)
+            # number_layers = self.num_layers
+            pass
 
-        num_pred = self.decoder.num_layers            
+        self.decoder = DeformableTransformerDecoder(
+            decoder_layer, number_layers, return_intermediate=True, predict_in_box_space=self.predict_in_box_space, num_layer_per_level=num_layer_per_level)
+
+        num_pred = self.decoder.num_layers
 
         if self.iterative_refinement:
             self.xy_embed = _get_clones(self.xy_embed, num_pred)
             nn.init.constant_(self.xy_embed[0].layers[-1].bias.data, 0.0)
-            self.decoder.xy_embed = self.xy_embed            
+            self.decoder.xy_embed = self.xy_embed
         else:
             self.xy_embed = nn.ModuleList([self.xy_embed for _ in range(num_pred)])
 
@@ -171,19 +174,22 @@ class BoundaryFormerPolygonHead(nn.Module):
             "is_upsampling": cfg.MODEL.BOUNDARY_HEAD.UPSAMPLING,
             "iterative_refinement": cfg.MODEL.BOUNDARY_HEAD.ITER_REFINE,
             "use_cls_token": cfg.MODEL.BOUNDARY_HEAD.USE_CLS_TOKEN,
-            "use_p2p_attn": cfg.MODEL.BOUNDARY_HEAD.USE_P2P_ATTN,            
+            "use_p2p_attn": cfg.MODEL.BOUNDARY_HEAD.USE_P2P_ATTN,
             "num_classes": cfg.MODEL.ROI_HEADS.NUM_CLASSES,
             "cls_agnostic": cfg.MODEL.BOUNDARY_HEAD.CLS_AGNOSTIC_MASK,
             "predict_in_box_space": cfg.MODEL.BOUNDARY_HEAD.PRED_WITHIN_BOX,
             "prepool": cfg.MODEL.BOUNDARY_HEAD.PREPOOL,
             "dropout": cfg.MODEL.BOUNDARY_HEAD.DROPOUT,
-            "deep_supervision": cfg.MODEL.BOUNDARY_HEAD.DEEP_SUPERVISION, 
+            "deep_supervision": cfg.MODEL.BOUNDARY_HEAD.DEEP_SUPERVISION,
+            "is_decoder_residual": cfg.MODEL.BOUNDARY_HEAD.IS_DECODER_RESIDUAL,
+            'detach_each_level': cfg.MODEL.BOUNDARY_HEAD.DETACH_EACH_LEVEL,
+            'num_layer_per_level': cfg.MODEL.BOUNDARY_HEAD.NUM_LAYER_PER_LEVEL,
         }
-        
+
         ret.update(
             input_shape=input_shape,
         )
-        
+
         return ret
 
     def get_valid_ratio(self, mask):
@@ -193,11 +199,11 @@ class BoundaryFormerPolygonHead(nn.Module):
         valid_ratio_h = valid_H.float() / H
         valid_ratio_w = valid_W.float() / W
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
-        return valid_ratio    
+        return valid_ratio
 
     def forward(self, x, instances: List[Instances]):
         x = [x[f] for f in self.in_features]
-        device = x[0].device            
+        device = x[0].device
 
         if self.prepool:
             if False:
@@ -215,14 +221,14 @@ class BoundaryFormerPolygonHead(nn.Module):
                     pooler_type="ROIAlignV2",
                     assign_to_single_level=False)
 
-                x = aligner(x, [Boxes(torch.Tensor([[0, 0, inst.image_size[1], inst.image_size[0]]]).to(x[0].device)) for inst in instances])        
-            
+                x = aligner(x, [Boxes(torch.Tensor([[0, 0, inst.image_size[1], inst.image_size[0]]]).to(x[0].device)) for inst in instances])
+
         if self.feature_proj is not None:
             x = [self.feature_proj[i](x_.permute(0, 2, 3, 1)).permute(0, 3, 1, 2) for i, x_ in enumerate(x)]
 
         number_levels = len(x)
         batch_size, feat_dim = x[0].shape[:2]
-        
+
         if not self.training:
             no_instances = len(instances[0]) == 0
             if no_instances:
@@ -247,7 +253,7 @@ class BoundaryFormerPolygonHead(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
-        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):            
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
@@ -258,7 +264,7 @@ class BoundaryFormerPolygonHead(nn.Module):
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
-            
+
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
@@ -272,16 +278,16 @@ class BoundaryFormerPolygonHead(nn.Module):
         else:
             query_embed, tgt = torch.split(self.point_embedding, self.model_dimension, dim=1)
 
-        number_instances = [len(inst) for inst in instances]            
+        number_instances = [len(inst) for inst in instances]
         max_instances = max(number_instances)
         box_preds_xyxy = pad_sequence([(inst.proposal_boxes.tensor if self.training else inst.pred_boxes.tensor) / torch.Tensor(2 * inst.image_size[::-1]).to(device)
                                        for inst in instances], batch_first=True)
-            
-        # normalize boxes            
+
+        # normalize boxes
         box_preds = [box_xyxy_to_cxcywh(
             (inst.proposal_boxes.tensor if self.training else inst.pred_boxes.tensor) / torch.Tensor(2 * inst.image_size[::-1]).to(device)) for inst in instances]
         box_preds = pad_sequence(box_preds, batch_first=True)
-            
+
         query_embed = query_embed.unsqueeze(0).unsqueeze(0).expand(batch_size, max_instances, -1, -1)
         tgt = tgt.unsqueeze(0).unsqueeze(0).expand(batch_size, max_instances, -1, -1)
         cls_token = None
@@ -302,18 +308,18 @@ class BoundaryFormerPolygonHead(nn.Module):
 
         memory = src_flatten + lvl_pos_embed_flatten
         hs, inter_references = self.decoder(
-            tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, cls_token=cls_token, reference_boxes=box_preds_xyxy)
-        
+            tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, cls_token=cls_token, reference_boxes=box_preds_xyxy, is_residual=self.is_decoder_residual, detach_each_level=self.detach_each_level)
+
         outputs_coords = []
         for lvl in range(len(hs)):
             xy = self.xy_embed[lvl](hs[lvl])
-            
+
             if self.predict_in_box_space:
                 outputs_coord = (inverse_sigmoid(inter_references[lvl]) + xy).sigmoid()
             else:
                 raise ValueError("todo")
 
-            # remove any padded entries.            
+            # remove any padded entries.
             outputs_coords.append(outputs_coord)
 
         # unpad and flatten across batch dim.
@@ -322,7 +328,7 @@ class BoundaryFormerPolygonHead(nn.Module):
             outputs_coords[i] = torch.cat([output_coords[j, :number_instances[j]] for j in range(batch_size)])
 
         if self.training:
-            vertex_losses = {}        
+            vertex_losses = {}
 
             for vertex_loss_fn in self.vertex_loss_fns:
                 output_losses = []
@@ -337,11 +343,10 @@ class BoundaryFormerPolygonHead(nn.Module):
 
                 vertex_losses[vertex_loss_fn.name] = torch.stack(output_losses)
 
-        
             ret_loss = {
                 "loss_{0}".format(vertex_loss_fn.name): vertex_loss_w * vertex_losses[vertex_loss_fn.name].mean()
                 for vertex_loss_w, vertex_loss_fn in zip(self.vertex_loss_ws, self.vertex_loss_fns)
-            }            
+            }
 
             # hack to monitor this.
             if hasattr(self.vertex_loss_fns[0], "inv_smoothness"):
@@ -349,15 +354,17 @@ class BoundaryFormerPolygonHead(nn.Module):
 
             return ret_loss
 
-        num_boxes_per_image = [len(i) for i in instances]
-
         # always take the last layer's outputs for now.
-        pred_polys_per_image = outputs_coords[-1].split(number_instances, dim=0)
-        for pred_polys, instance in zip(pred_polys_per_image, instances):
-            instance.pred_polys = pred_polys
-        
+        pred_polys_per_image_per_layer = [layer_output.split(number_instances, dim=0) for layer_output in outputs_coords]
+        pred_polys_per_layer_per_image = [list(a) for a in zip(*pred_polys_per_image_per_layer)]
+        for pred_polys_per_layer, instance in zip(pred_polys_per_layer_per_image, instances):
+            for i, polys in enumerate(pred_polys_per_layer):
+                instance.set(f'pred_polys_{i}', polys)
+            instance.pred_polys = pred_polys_per_layer[-1]  # last layer
+
         return instances
-        
+
+
 def build_poly_losses(cfg, input_shape):
     """
     Build polygon losses `cfg.MODEL.BOUNDARY_HEAD.POLY_LOSS.NAMES`.

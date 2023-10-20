@@ -58,15 +58,23 @@ class ClippingStrategy(nn.Module):
 
         return torch.cat(gt_masks).squeeze(1)
 
-def dice_loss(input, target):
+def dice_loss(input, target, weight_FP=1, weight_FN=1):
     smooth = 1.
 
     iflat = input.reshape(-1)
     tflat = target.reshape(-1)
     intersection = (iflat * tflat).sum()
-    
-    return 1 - ((2. * intersection + smooth) /
-              (iflat.sum() + tflat.sum() + smooth))
+
+    # return 1 - ((2. * intersection + smooth) /
+    #           (iflat.sum() + tflat.sum() + smooth))
+
+    # NOTE SEN
+    # the original equals to (iflat.sum() - intersection + tflat.sum() - intersection) / (iflat.sum() + tflat.sum() + smooth)
+    # an approximate is
+    # ((iflat-iflat*tflat).sum() + (tflat-iflat*tflat).sum()) / (iflat.sum() + tflat.sum() + smooth)
+    # left term is False-Positive, right term is False-Negative
+    return ((iflat-iflat*tflat).sum()*weight_FP + (tflat-iflat*tflat).sum()*weight_FN) / (iflat.sum() + tflat.sum() + smooth)
+
 
 @POLY_LOSS_REGISTRY.register()
 class MaskRasterizationLoss(nn.Module):
@@ -94,7 +102,7 @@ class MaskRasterizationLoss(nn.Module):
             self.gt_rasterizer = SoftPolygon(inv_smoothness=1.0, mode="hard_mask")
 
         self.offset = 0.5
-        self.loss_fn = dice_loss
+        self.loss_fn = lambda i, t: dice_loss(i, t, cfg.MODEL.DIFFRAS.DICE_LOSS_WEIGHT_FP, cfg.MODEL.DIFFRAS.DICE_LOSS_WEIGHT_FN)
         self.name = "mask"
 
     def _create_targets(self, instances, clip_boxes=None, lid=0):
