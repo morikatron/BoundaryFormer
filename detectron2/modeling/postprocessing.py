@@ -45,6 +45,7 @@ def detector_postprocess(
         output_width_tmp / results.image_size[1],
         output_height_tmp / results.image_size[0],
     )
+    old_results = results
     results = Instances(new_size, **results.get_fields())
 
     if results.has("pred_boxes"):
@@ -59,6 +60,12 @@ def detector_postprocess(
     output_boxes.clip(results.image_size)
 
     results = results[output_boxes.nonempty()]
+
+    if hasattr(old_results, '_proposal'):
+        setattr(results, '_proposal', old_results._proposal)
+        pboxes = results._proposal.get('proposal_boxes')
+        pboxes.scale(scale_x, scale_y)
+        pboxes.clip(results.image_size)
 
     if results.has("pred_polys"):
         if len(results) == 0:

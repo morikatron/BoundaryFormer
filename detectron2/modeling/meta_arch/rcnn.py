@@ -211,12 +211,12 @@ class GeneralizedRCNN(nn.Module):
             detected_instances = [x.to(self.device) for x in detected_instances]
             results = self.roi_heads.forward_with_given_boxes(features, detected_instances)
 
+        if proposals is not None:
+            for p, r in zip(proposals, results):
+                setattr(r, '_proposal', p)
         if do_postprocess:
             assert not torch.jit.is_scripting(), "Scripting is not supported for postprocess."
             results = GeneralizedRCNN._postprocess(results, batched_inputs, images.image_sizes)
-        if proposals is not None:
-            for p, r in zip(proposals, results):
-                setattr(r['instances'], '_proposal', p)
         return results
 
     def preprocess_image(self, batched_inputs: List[Dict[str, torch.Tensor]]):
