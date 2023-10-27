@@ -6,6 +6,7 @@ PointRend Training Script.
 
 This script is a simplified version of the training script in detectron2/tools.
 """
+import mpvit
 
 import os
 import torch
@@ -30,6 +31,11 @@ from detectron2.solver import get_default_optimizer_params
 from detectron2.solver.build import maybe_add_gradient_clipping
 
 from boundary_former import add_boundaryformer_config
+
+
+from detectron2.data.datasets import register_coco_instances
+# NOTE: example: register_coco_instances("af_data5_train", {}, "/mnt/hd1/yoshida/mmdetection/dataset/af_data5/train/coco.json", "/mnt/hd1/yoshida/mmdetection/dataset/af_data5/train/")
+
 
 def build_sem_seg_train_aug(cfg):
     augs = [
@@ -145,6 +151,7 @@ def setup(args):
     """
     cfg = get_cfg()
     add_boundaryformer_config(cfg)
+    mpvit.add_mpvit_config(cfg)
     
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)

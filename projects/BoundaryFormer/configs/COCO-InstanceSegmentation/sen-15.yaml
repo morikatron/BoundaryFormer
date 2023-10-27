@@ -1,0 +1,51 @@
+_BASE_: "../Base-RCNN-FPN-MPVIT.yaml"
+MODEL:
+  WEIGHTS: "https://dl.dropbox.com/s/wiqpwiw35k7t6z7/mpvit_base_d2.pth"
+  MPVIT:
+    NAME: "mpvit_base"
+    DROP_PATH: 0.4
+    NORM: "BN"  # NOTE MUST for single GPU
+  MASK_ON: True
+  ROI_MASK_HEAD:
+    NAME: "BoundaryFormerPolygonHead"
+    POOLER_TYPE: ""
+  RETINANET:
+    NUM_CLASSES: 2
+  BOUNDARY_HEAD:
+    IN_FEATURES: ["p2", "p3", "p4", "p5"]
+    PRED_WITHIN_BOX: True
+    POLY_NUM_PTS: 64
+    CLS_AGNOSTIC_MASK: True
+    
+    IS_DECODER_RESIDUAL: False
+
+  DIFFRAS:
+    RESOLUTIONS: (64, 64, 64, 64, 64, 64, 64, 64)
+    USE_RASTERIZED_GT: False
+    INV_SMOOTHNESS_SCHED: (0.1,)
+  ROI_HEADS:
+    PROPOSAL_ONLY_GT: False
+    NUM_CLASSES: 2
+    NMS_THRESH_TEST: 0.5
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 2
+  RPN:
+    NMS_THRESH: 0.7
+SOLVER:
+  OPTIMIZER: "ADAM"
+  BASE_LR: 1e-5
+  WEIGHT_DECAY: 0.05
+  WEIGHT_DECAY_NORM: 0.0
+  CLIP_GRADIENTS:
+    ENABLED: False
+  STEPS: (100000, 140000)
+  MAX_ITER: 160000
+  IMS_PER_BATCH: 1
+  CHECKPOINT_PERIOD: 20000
+DATASETS:
+  TRAIN: ("af_data_bubble_train",)
+  TEST: ("af_data_bubble_test",)
+VIS_PERIOD: 0
+TEST:
+  EVAL_PERIOD: 40000
+
