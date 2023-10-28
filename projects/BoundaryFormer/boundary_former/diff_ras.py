@@ -173,3 +173,23 @@ class MaskRasterizationLoss(nn.Module):
             target_masks = target_masks.unsqueeze(1).float()
             
         return self.loss_fn(pred_masks, target_masks), target_masks
+
+
+@POLY_LOSS_REGISTRY.register()
+class PolySmoothnessLoss(nn.Module):
+    def __init__(self, cfg, input_shape):
+        super().__init__()
+
+    def forward(self, verts, targets, lid=0):
+        """verts: [b*n, pts, 2]"""
+        if isinstance(targets, torch.Tensor):
+            device = targets.device
+        else:
+            device = targets[0].gt_boxes.device
+
+        edges = torch.roll(verts, 1, 1) - verts
+        edges = torch.nn.functional.normalize(edges, dim=2)
+        edges_ = torch.roll(edges, 1, 1)
+        loss = - torch.dot(torch.flatten(edges), torch.flatten(edges_)) / edges.shape[0] / 4  # NOTE 4 cuz' usually rect. edges.shape[1]
+
+        return loss, targets
