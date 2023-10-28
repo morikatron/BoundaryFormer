@@ -192,6 +192,14 @@ class PolySmoothnessLoss(nn.Module):
         edges = torch.roll(verts, 1, 1) - verts
         edges = torch.nn.functional.normalize(edges, dim=2)
         edges_ = torch.roll(edges, 1, 1)
-        loss = - torch.dot(torch.flatten(edges), torch.flatten(edges_)) / edges.shape[0] / 4  # NOTE 4 cuz' usually rect. edges.shape[1]
+
+        edges = torch.reshape(edges, [-1, 2])
+        edges_ = torch.reshape(edges_, [-1, 2])
+        cos = torch.sum(edges * edges_, dim=1)
+        loss = (1-cos)/2
+        loss = loss ** 2
+        loss = torch.sum(loss)
+        loss /= verts.shape[0]
+        loss /= 4  # NOTE 4 cuz' usually rect. verts.shape[1]
 
         return loss, targets

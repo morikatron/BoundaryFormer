@@ -14,7 +14,7 @@ MODEL:
     CLS_AGNOSTIC_MASK: True
     POLY_LOSS:
       NAMES: ["MaskRasterizationLoss", "PolySmoothnessLoss"]
-      WS: [1.0, 1.0]
+      WS: [1.0, 2.0]
 
   DIFFRAS:
     RESOLUTIONS: (64, 64, 64, 64, 64, 64, 64, 64)
