@@ -180,6 +180,8 @@ class PolySmoothnessLoss(nn.Module):
     def __init__(self, cfg, input_shape):
         super().__init__()
 
+        self.name = 'smooth'
+
     def forward(self, verts, targets, lid=0):
         """verts: [b*n, pts, 2]"""
         if isinstance(targets, torch.Tensor):
