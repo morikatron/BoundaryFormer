@@ -12,8 +12,9 @@ MODEL:
     PRED_WITHIN_BOX: True
     POLY_NUM_PTS: 64
     CLS_AGNOSTIC_MASK: True
-    POLY_LOSS.NAMES: ["MaskRasterizationLoss", "PolySmoothnessLoss"]
-    POLY_LOSS.WS: [1.0, 1.0]
+    POLY_LOSS:
+      NAMES: ["MaskRasterizationLoss", "PolySmoothnessLoss"]
+      WS: [1.0, 1.0]
 
   DIFFRAS:
     RESOLUTIONS: (64, 64, 64, 64, 64, 64, 64, 64)
