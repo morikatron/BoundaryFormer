@@ -1,0 +1,32 @@
+_BASE_: "../Base-RCNN-FPN.yaml"
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: True
+  RESNETS:
+    DEPTH: 50
+  ROI_HEADS:
+    NUM_CLASSES: 2
+  ROI_MASK_HEAD:
+    POOLER_RESOLUTION: 32
+SOLVER:
+  OPTIMIZER: "ADAM"
+  BASE_LR: 1e-4
+  WEIGHT_DECAY: 0.05 # Do we need more?
+  WEIGHT_DECAY_NORM: 0.0
+  IMS_PER_BATCH: 4
+  CLIP_GRADIENTS:
+    ENABLED: False
+  STEPS: (50000, 70000)
+  MAX_ITER: 80000
+  CLIP_GRADIENTS:
+    ENABLED: False
+  CHECKPOINT_PERIOD: 5000
+INPUT:
+  # Is this mandatory for 3x?
+  DETR_STYLE_AUG: False
+TEST:
+  EVAL_PERIOD: 80000
+DATASETS:
+  TRAIN: ("af_data_bubble_train",)
+  TEST: ("af_data_bubble_test",)
+VIS_PERIOD: 0
