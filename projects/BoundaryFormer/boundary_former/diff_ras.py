@@ -180,14 +180,13 @@ class PolySmoothnessLoss(nn.Module):
     def __init__(self, cfg, input_shape):
         super().__init__()
 
+        self.ws = cfg.MODEL.DIFFRAS.POLY_SMOOTH_LOSS_WEIGHT_POINTWISE
+
         self.name = 'polysmooth'
 
     def forward(self, verts, targets, lid=0):
         """verts: [b*n, pts, 2]"""
-        if isinstance(targets, torch.Tensor):
-            device = targets.device
-        else:
-            device = targets[0].gt_boxes.device
+        device = targets.device if isinstance(targets, torch.Tensor) else targets[0].gt_boxes.device
 
         edges = torch.roll(verts, 1, 1) - verts
         edges = torch.nn.functional.normalize(edges, dim=2)
@@ -196,8 +195,18 @@ class PolySmoothnessLoss(nn.Module):
         edges = torch.reshape(edges, [-1, 2])
         edges_ = torch.reshape(edges_, [-1, 2])
         cos = torch.sum(edges * edges_, dim=1)
-        loss = (1-cos)/2
-        loss = loss ** 2
+        loss = ((1-cos)/2) ** 2
+        loss = torch.reshape(loss, [verts.shape[0], verts.shape[1]])  # [b*n, pts]
+
+        # weighted
+        sorted_loss, _ = torch.sort(loss, descending=True)
+        weights = torch.ones([verts.shape[1]], device=device)
+        for i, w in enumerate(self.ws):
+            if i > weights.shape[0]-1:
+                break
+            weights[i] = w
+        loss = sorted_loss * weights
+
         loss = torch.sum(loss)
         loss /= verts.shape[0]
         loss /= 4  # NOTE 4 cuz' usually rect. verts.shape[1]
