@@ -203,7 +203,7 @@ class PolySmoothnessLoss(nn.Module):
         sorted_loss, _ = torch.sort(loss, descending=True)
 
         if self.wtype == 'linear':
-            weights = torch.max(torch.arange(verts.shape[1], device=device) - 3, 0) * 0.1
+            weights = torch.max(torch.arange(verts.shape[1], device=device, dtype=torch.float) - 3, 0) * 0.1
         else:
             weights = torch.ones([verts.shape[1]], device=device)
             for i, w in enumerate(self.ws):
