@@ -180,6 +180,7 @@ class PolySmoothnessLoss(nn.Module):
     def __init__(self, cfg, input_shape):
         super().__init__()
 
+        self.wtype = cfg.MODEL.DIFFRAS.POLY_SMOOTH_LOSS_WEIGHT_TYPE
         self.ws = cfg.MODEL.DIFFRAS.POLY_SMOOTH_LOSS_WEIGHT_POINTWISE
 
         self.name = 'polysmooth'
@@ -200,11 +201,15 @@ class PolySmoothnessLoss(nn.Module):
 
         # weighted
         sorted_loss, _ = torch.sort(loss, descending=True)
-        weights = torch.ones([verts.shape[1]], device=device)
-        for i, w in enumerate(self.ws):
-            if i > weights.shape[0]-1:
-                break
-            weights[i] = w
+
+        if self.wtype == 'linear':
+            weights = torch.max(torch.arange(verts.shape[1], device=device) - 3, 0) * 0.1
+        else:
+            weights = torch.ones([verts.shape[1]], device=device)
+            for i, w in enumerate(self.ws):
+                if i > weights.shape[0]-1:
+                    break
+                weights[i] = w
         loss = sorted_loss * weights
 
         loss = torch.sum(loss)
