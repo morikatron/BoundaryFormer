@@ -276,7 +276,8 @@ class DeformableTransformerDecoder(nn.Module):
 
             # NOTE By default, xy_embed is a list of (different) MLP, whose out dim is 2
             if self.xy_embed is not None:
-                xy_diff = self.xy_embed[lid](state_diff)  # [batch, instances, points, 2]
+                idx_mlp = min(len(self.xy_embed)-1, lid)
+                xy_diff = self.xy_embed[idx_mlp](state_diff)  # [batch, instances, points, 2]
 
                 assert reference_points.shape[-1] == 2
                 new_reference_points = (xy_diff + inverse_sigmoid(reference_points)).sigmoid()
