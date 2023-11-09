@@ -39,7 +39,7 @@ class BoundaryFormerPolygonHead(nn.Module):
                  model_dim=256, base_number_control_points=8, number_control_points=64, number_layers=4, vis_period=0,
                  is_upsampling=True, iterative_refinement=False, use_cls_token=False, use_p2p_attn=True, num_classes=80, cls_agnostic=False,
                  predict_in_box_space=False, prepool=True, dropout=0.0, deep_supervision=True,
-                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, gan_loss=0, gan=None, is_additional_level=False, detach_additional_level=False **kwargs
+                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, gan_loss=0, gan=None, is_additional_level=False, detach_additional_level=False, **kwargs
                  ):
         """
         NOTE: this interface is experimental.
