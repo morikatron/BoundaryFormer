@@ -369,7 +369,7 @@ class BoundaryFormerPolygonHead(nn.Module):
 
             if self.gan:
                 output_coords = additional_output_coords if self.is_additional_level else outputs_coords[-1]
-                gloss, dloss, _ = self.gan(outputs_coords[-1], instances)
+                gloss, dloss, _ = self.gan(output_coords, instances)
                 ret_loss['loss_gan_g'] = gloss * self.gan_loss
                 ret_loss['loss_gan_d'] = dloss * self.gan_loss
 
@@ -474,17 +474,30 @@ class PolyContrastiveLoss(nn.Module):
         gt_polys = []  # list of [x0, y0, x1, y1, ...]
         for target in targets:
             masks: PolygonMasks = target.get('gt_masks')
+            boxes: Boxes = target.get('gt_boxes')
             polys_inss = masks.polygons
-            for polys in polys_inss:
+            for polys, box in zip(polys_inss, boxes):
                 poly = polys[0].astype(np.float32)
+                box = box.cpu().numpy()
+
                 poly = self.align_poly_npts(poly, npts)
+
+                # normalize
+                poly = poly.reshape([len(poly)//2, 2])
+                poly = (poly - box[:2]) / (box[2:] - box[:2])
+                poly = poly.reshape([-1])
+
                 poly = torch.tensor(poly).to(torch.float).to(device)
+
+                # Start from left-top corner
+                poly = self.align_poly_order(poly)
                 gt_polys.append(poly)
 
         assert verts.shape[0] == len(gt_polys)
         gt_polys = torch.stack(gt_polys)  # [num of ins, npts*2]
         verts = torch.reshape(verts, [verts.shape[0], -1])
-        # print('gt polys', gt_polys.shape, 'verts', verts.shape)
+        # Start from left-top corner
+        verts = torch.stack([self.align_poly_order(vert) for vert in verts])
 
         dloss = torch.mean(1 - self.model(gt_polys))
         dloss += torch.mean(self.model(verts.detach()))
@@ -493,7 +506,18 @@ class PolyContrastiveLoss(nn.Module):
         self.model_infer.load_state_dict(self.model.state_dict())
         gloss = torch.mean(1 - self.model_infer(verts))
 
-        return gloss, dloss, targets
+        if dloss < 0.3:
+            dloss = dloss.detach()
+
+        return gloss*self.g_loss_weight, dloss*self.d_loss_weight, targets
+
+    def align_poly_order(self, poly: torch.Tensor):
+        poly = poly.reshape([-1, 2])
+        # Roll poly, so that point with min x+y at first.
+        xplusy = torch.sum(poly, 1)
+        idx = torch.argmin(xplusy).cpu().detach().numpy()
+        poly = torch.roll(poly, -idx, dims=0)
+        return poly.reshape([-1])
 
     def align_poly_npts(self, poly: np.ndarray, npts: int):
         """Align length to npts. Using cv2.approxPolyDP to reduce number of points.
