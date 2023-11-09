@@ -1,9 +1,12 @@
+from random import random
+from typing import List
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from detectron2.structures.instances import Instances
+from detectron2.structures.masks import PolygonMasks
 from detectron2.utils.events import get_event_storage
 
 from boundary_former.layers.diff_ras.polygon import SoftPolygon
@@ -215,5 +218,75 @@ class PolySmoothnessLoss(nn.Module):
         loss = torch.sum(loss)
         loss /= verts.shape[0]
         loss /= 4  # NOTE 4 cuz' usually rect. verts.shape[1]
+
+        return loss, targets
+
+
+from .transformer import MLP
+import math
+@POLY_LOSS_REGISTRY.register()
+class PolyContrastiveLoss(nn.Module):
+    def __init__(self, cfg, input_shape):
+        super().__init__()
+
+        self.wtype = cfg.MODEL.DIFFRAS.POLY_SMOOTH_LOSS_WEIGHT_TYPE
+        self.ws = cfg.MODEL.DIFFRAS.POLY_SMOOTH_LOSS_WEIGHT_POINTWISE
+
+        if cfg.MODEL.BOUNDARY_HEAD.UPSAMPLING:
+            self.last_lid = int(math.log2(cfg.MODEL.BOUNDARY_HEAD.POLY_NUM_PTS // cfg.MODEL.BOUNDARY_HEAD.UPSAMPLING_BASE_NUM_PTS))
+        else:
+            self.last_lid = cfg.MODEL.BOUNDARY_HEAD.NUM_DEC_LAYER
+        self.npts = cfg.MODEL.BOUNDARY_HEAD.POLY_NUM_PTS
+
+        self.mlp = MLP(self.npts*2, 256, 1, 4)
+        self.mlp_infer = MLP(self.npts*2, 256, 1, 4)
+        self.mlp_infer.requires_grad_(False)
+
+        self.name = 'polycntr'
+
+    def forward(self, verts: torch.Tensor, targets: List[Instances], lid=0):
+        """verts: [num of instances over whole batch, pts, 2]"""
+        device = targets.device if isinstance(targets, torch.Tensor) else targets[0].gt_boxes.device
+        if lid != self.last_lid:
+            return torch.tensor(0).to(device), targets
+
+        npts = verts.shape[1]
+
+        gt_polys = []  # list of [x0, y0, x1, y1, ...]
+        for b, target in enumerate(targets):
+            masks: PolygonMasks = target.get('gt_masks')
+            polys_inss = masks.polygons
+            for i, polys in enumerate(polys_inss):
+                poly = polys[0]  # NOTE 原則的に1個しかない（稀に2個あるが）
+                # align length to npts
+                if npts > len(poly)/2:
+                    for _ in range(npts-len(poly)//2):
+                        pos = random() * (len(poly)//2-1)
+                        idx = int(pos)
+                        k = pos - idx
+                        xm = poly[idx*2] * (1-k) + poly[idx*2+2] * k
+                        ym = poly[idx*2+1] * (1-k) + poly[idx*2+3] * k
+                        poly = np.concatenate([poly[:idx*2+2], [xm], [ym], poly[idx*2+2:]])
+                elif npts < len(poly)/2:
+                    for _ in range(len(poly)//2-npts):
+                        pos = random() * (len(poly)//2)
+                        idx = int(pos)
+                        poly = np.concatenate([poly[:idx*2], poly[idx*2+2:]])
+                poly = torch.tensor(poly).to(torch.float).to(device)
+                gt_polys.append(poly)
+
+        assert verts.shape[0] == len(gt_polys)
+        gt_polys = torch.stack(gt_polys)
+        verts = torch.reshape(verts, [verts.shape[0], -1])
+        # print('gt polys', gt_polys.shape, 'verts', verts.shape)
+
+        dloss = torch.mean(1 - torch.sigmoid(self.mlp(gt_polys)))
+        dloss += torch.mean(torch.sigmoid(self.mlp(verts.detach())))
+        dloss /= 2
+
+        self.mlp_infer.load_state_dict(self.mlp.state_dict())
+        gloss = torch.mean(1 - torch.sigmoid(self.mlp_infer(verts)))
+
+        loss = dloss + gloss
 
         return loss, targets

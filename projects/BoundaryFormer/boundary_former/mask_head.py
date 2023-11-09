@@ -33,7 +33,7 @@ class BoundaryFormerPolygonHead(nn.Module):
                  model_dim=256, base_number_control_points=8, number_control_points=64, number_layers=4, vis_period=0,
                  is_upsampling=True, iterative_refinement=False, use_cls_token=False, use_p2p_attn=True, num_classes=80, cls_agnostic=False,
                  predict_in_box_space=False, prepool=True, dropout=0.0, deep_supervision=True,
-                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, **kwargs
+                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, gan_loss=0, **kwargs
                  ):
         """
         NOTE: this interface is experimental.
@@ -139,6 +139,11 @@ class BoundaryFormerPolygonHead(nn.Module):
         else:
             self.xy_embed = nn.ModuleList([self.xy_embed for _ in range(num_pred)])
 
+        self.gan_loss = gan_loss
+        self.gan = None
+        if self.gan_loss != 0:
+            self.gan = PolyContrastiveLoss(number_control_points)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -184,6 +189,7 @@ class BoundaryFormerPolygonHead(nn.Module):
             "is_decoder_residual": cfg.MODEL.BOUNDARY_HEAD.IS_DECODER_RESIDUAL,
             'detach_each_level': cfg.MODEL.BOUNDARY_HEAD.DETACH_EACH_LEVEL,
             'num_layer_per_level': cfg.MODEL.BOUNDARY_HEAD.NUM_LAYER_PER_LEVEL,
+            'gan_loss': cfg.MODEL.BOUNDARY_HEAD.GAN_LOSS,
         }
 
         ret.update(
@@ -291,7 +297,7 @@ class BoundaryFormerPolygonHead(nn.Module):
         query_embed = query_embed.unsqueeze(0).unsqueeze(0).expand(batch_size, max_instances, -1, -1)
         tgt = tgt.unsqueeze(0).unsqueeze(0).expand(batch_size, max_instances, -1, -1)
         cls_token = None
- 
+
         # sample with respect to box.
         if self.ref_init == "ellipse":
             if self.predict_in_box_space:
@@ -348,6 +354,11 @@ class BoundaryFormerPolygonHead(nn.Module):
                 for vertex_loss_w, vertex_loss_fn in zip(self.vertex_loss_ws, self.vertex_loss_fns)
             }
 
+            if self.gan:
+                gloss, dloss, _ = self.gan(outputs_coords[-1], instances)
+                ret_loss['loss_gan_g'] = gloss * self.gan_loss
+                ret_loss['loss_gan_d'] = dloss * self.gan_loss
+
             # hack to monitor this.
             if hasattr(self.vertex_loss_fns[0], "inv_smoothness"):
                 ret_loss["loss_smooth"] = torch.Tensor([self.vertex_loss_fns[0].inv_smoothness]).to(device)
@@ -375,3 +386,140 @@ def build_poly_losses(cfg, input_shape):
         losses.append(POLY_LOSS_REGISTRY.get(name)(cfg, input_shape))
 
     return losses
+
+
+from random import random
+from typing import List
+import numpy as np
+import math
+from detectron2.structures.masks import PolygonMasks
+import cv2
+
+
+class PolyDiscriminator(nn.Module):
+    def __init__(self, d_model: int = 256, nhead: int = 8, nlayers: int = 4, max_len: int = 64) -> None:
+        super().__init__()
+
+        self.d_model = d_model
+        self.max_len = max_len
+
+        enc_lyr = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model)
+        self.enc = nn.TransformerEncoder(enc_lyr, num_layers=nlayers)
+
+        self.register_buffer("pe", point_encoding(d_model, max_len=max_len))
+
+        self.ff = nn.Linear(d_model, 1)
+
+    def forward(self, xy: torch.Tensor):
+        """
+        Args:
+            x: polys [instances, npoints * 2]
+        """
+        x = self.encode_number(xy[:, 0::2], self.d_model//2, self.max_len)  # [instances, npoints, d_model//2]
+        y = self.encode_number(xy[:, 1::2], self.d_model//2, self.max_len*2)  # [instances, npoints, d_model//2]
+        x = torch.cat([x, y], dim=2)  # [instances, npoints, d_model]
+
+        x += self.pe[:x.shape[1]].to(x.device)  # [instances, npoints, d_model]
+
+        x = x.transpose(0, 1)  # [npoints, instances, d_model]
+        x = self.enc(x)
+
+        x = self.ff(x)  # [npoints, instances, 1]
+        x = x.transpose(0, 1)  # [instances, npoints, 1]
+        x = torch.mean(x, dim=1)  # [instances, 1]
+
+        return torch.sigmoid(x)
+
+    def encode_number(self, pos: torch.Tensor, d_model: int, pos_offset=64):
+        """
+            pos: [instances, npoints * 2]
+            pos_offset: position_encoding may create similar embeds, so add offset to avoid. Should > max length of seq.
+        Returns:
+            pos: [instances, npoints, d_model]
+        """
+        pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(pos.device)
+        pos = pos.unsqueeze(2)
+        pos = pos * 100 + pos_offset
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)).to(pos.device)
+        pe[:, :, 0::2] = torch.sin(pos * div_term)
+        pe[:, :, 1::2] = torch.cos(pos * div_term)
+        return pe
+
+
+class PolyContrastiveLoss(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+
+        self.npts = input_dim
+        d_model = 256
+
+        # self.mlp = MLP(self.npts*2, d_model, 1, 4)
+        # self.mlp_infer = MLP(self.npts*2, d_model, 1, 4)
+        # self.mlp_infer.requires_grad_(False)
+
+        self.model = PolyDiscriminator(d_model, max_len=self.npts)
+        self.model_infer = PolyDiscriminator(d_model, max_len=self.npts)
+        self.model_infer.requires_grad_(False)
+
+    def forward(self, verts: torch.Tensor, targets: List[Instances]):
+        """verts: [num of instances over whole batch, pts, 2]"""
+        device = targets.device if isinstance(targets, torch.Tensor) else targets[0].gt_boxes.device
+        npts = verts.shape[1]
+
+        gt_polys = []  # list of [x0, y0, x1, y1, ...]
+        for target in targets:
+            masks: PolygonMasks = target.get('gt_masks')
+            polys_inss = masks.polygons
+            for polys in polys_inss:
+                poly = polys[0].astype(np.float32)
+                poly = self.align_poly_npts(poly, npts)
+                poly = torch.tensor(poly).to(torch.float).to(device)
+                gt_polys.append(poly)
+
+        assert verts.shape[0] == len(gt_polys)
+        gt_polys = torch.stack(gt_polys)  # [num of ins, npts*2]
+        verts = torch.reshape(verts, [verts.shape[0], -1])
+        # print('gt polys', gt_polys.shape, 'verts', verts.shape)
+
+        dloss = torch.mean(1 - self.model(gt_polys))
+        dloss += torch.mean(self.model(verts.detach()))
+        dloss /= 2
+
+        self.model_infer.load_state_dict(self.model.state_dict())
+        gloss = torch.mean(1 - self.model_infer(verts))
+
+        return gloss, dloss, targets
+
+    def align_poly_npts(self, poly: np.ndarray, npts: int):
+        # align length to npts
+        if npts < len(poly)/2:
+            cnt = poly.reshape([len(poly)//2, 1, 2])
+            cnt_less = None
+            length = cv2.arcLength(cnt, True)
+            eps_less = 0.5 * length
+            eps_more = 0
+            eps = 0.1 * length
+            for _ in range(10):
+                cnt_ = cv2.approxPolyDP(cnt, eps, True)
+                if len(cnt_) == npts:
+                    cnt_less = cnt_
+                    break
+                elif len(cnt_) < npts:
+                    eps_less = eps
+                    cnt_less = cnt_
+                else:
+                    eps_more = eps
+                eps = eps_less/2 + eps_more/2
+            poly = cnt_less.reshape([-1])
+
+        if npts > len(poly)/2:
+            for _ in range(npts-len(poly)//2):
+                pos = random() * (len(poly)//2-1)
+                idx = int(pos)
+                k = pos - idx
+                xm = poly[idx*2] * (1-k) + poly[idx*2+2] * k
+                ym = poly[idx*2+1] * (1-k) + poly[idx*2+3] * k
+                poly = np.concatenate([poly[:idx*2+2], [xm], [ym], poly[idx*2+2:]])
+
+        return poly
+
