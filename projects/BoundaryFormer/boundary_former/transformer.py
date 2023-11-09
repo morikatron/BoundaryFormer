@@ -194,7 +194,7 @@ class UpsamplingDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False, predict_in_box_space=False, num_layer_per_level=1):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False, predict_in_box_space=False, num_layer_per_level=1, is_additional_level=False):
         super().__init__()
 
         self.layers = []
@@ -204,23 +204,31 @@ class DeformableTransformerDecoder(nn.Module):
                     self.layers.append(copy.deepcopy(decoder_layer))
                 else:
                     self.layers.append(copy.deepcopy(decoder_layer.inner))
+        if is_additional_level:
+            for ilyr in range(num_layer_per_level):
+                if isinstance(decoder_layer, DeformableTransformerControlLayer):
+                    self.layers.append(copy.deepcopy(decoder_layer))
+                else:
+                    self.layers.append(copy.deepcopy(decoder_layer.inner))
+
         self.layers = nn.ModuleList(self.layers)
 
         self.num_layers = num_layers
         self.num_layer_per_level = num_layer_per_level
         self.return_intermediate = return_intermediate
         self.predict_in_box_space = predict_in_box_space
+        self.is_additional_level = is_additional_level
 
         # iterative refinement.
         self.xy_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None, cls_token=None, reference_boxes=None, is_residual=False, detach_each_level=False):
+                query_pos=None, src_padding_mask=None, cls_token=None, reference_boxes=None, is_residual=False, detach_each_level=False, detach_additional_level=False):
         state = tgt
 
         intermediate = []
         intermediate_reference_points = []
-        for lid in range(self.num_layers):
+        for lid in range(self.num_layers + (1 if self.is_additional_level else 0)):
             layers = self.layers[lid*self.num_layer_per_level:(lid+1)*self.num_layer_per_level]
             if self.return_intermediate:
                 intermediate_reference_points.append(reference_points)
@@ -247,7 +255,7 @@ class DeformableTransformerDecoder(nn.Module):
                 state = inserted_state + state_diff  # NOTE SEN: should be a residual output
             else:
                 state = state_diff
-            if detach_each_level:
+            if detach_each_level or lid == self.num_layers and detach_additional_level:
                 state = state.detach()
 
             if not (cls_token is None):
@@ -274,7 +282,7 @@ class DeformableTransformerDecoder(nn.Module):
                 new_reference_points = (xy_diff + inverse_sigmoid(reference_points)).sigmoid()
                 # unclear if detach() matters.
                 reference_points = new_reference_points
-            if detach_each_level:
+            if detach_each_level or lid == self.num_layers and detach_additional_level:
                 reference_points = reference_points.detach()
 
             if self.return_intermediate:

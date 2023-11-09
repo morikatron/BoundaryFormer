@@ -6,10 +6,16 @@ from torch.nn import functional as F
 # This code is from https://github.com/mlpc-ucsd/BoundaryFormer
 from typing import List
 
+from random import random
+import numpy as np
+import math
+import cv2
+
 from detectron2.config import configurable
 from detectron2.layers import Conv2d, ConvTranspose2d, ShapeSpec, cat, get_norm
 from detectron2.modeling import ROI_MASK_HEAD_REGISTRY
 from detectron2.structures import Boxes, Instances
+from detectron2.structures.masks import PolygonMasks
 
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.registry import Registry
@@ -33,7 +39,7 @@ class BoundaryFormerPolygonHead(nn.Module):
                  model_dim=256, base_number_control_points=8, number_control_points=64, number_layers=4, vis_period=0,
                  is_upsampling=True, iterative_refinement=False, use_cls_token=False, use_p2p_attn=True, num_classes=80, cls_agnostic=False,
                  predict_in_box_space=False, prepool=True, dropout=0.0, deep_supervision=True,
-                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, gan_loss=0, **kwargs
+                 is_decoder_residual=False, detach_each_level=False, num_layer_per_level=1, gan_loss=0, gan=None, is_additional_level=False, detach_additional_level=False **kwargs
                  ):
         """
         NOTE: this interface is experimental.
@@ -69,6 +75,10 @@ class BoundaryFormerPolygonHead(nn.Module):
         self.deep_supervision = deep_supervision
         self.is_decoder_residual = is_decoder_residual
         self.detach_each_level = detach_each_level
+        self.gan_loss = gan_loss
+        self.is_additional_level = is_additional_level
+        self.detach_additional_level = detach_additional_level
+        self.gan = gan
 
         self.vertex_loss_fns = []
         for loss_fn in vertex_loss_fns:
@@ -128,7 +138,7 @@ class BoundaryFormerPolygonHead(nn.Module):
             pass
 
         self.decoder = DeformableTransformerDecoder(
-            decoder_layer, number_layers, return_intermediate=True, predict_in_box_space=self.predict_in_box_space, num_layer_per_level=num_layer_per_level)
+            decoder_layer, number_layers, return_intermediate=True, predict_in_box_space=self.predict_in_box_space, num_layer_per_level=num_layer_per_level, is_additional_level=self.is_additional_level)
 
         num_pred = self.decoder.num_layers
 
@@ -138,11 +148,6 @@ class BoundaryFormerPolygonHead(nn.Module):
             self.decoder.xy_embed = self.xy_embed
         else:
             self.xy_embed = nn.ModuleList([self.xy_embed for _ in range(num_pred)])
-
-        self.gan_loss = gan_loss
-        self.gan = None
-        if self.gan_loss != 0:
-            self.gan = PolyContrastiveLoss(number_control_points)
 
         self._reset_parameters()
 
@@ -190,6 +195,9 @@ class BoundaryFormerPolygonHead(nn.Module):
             'detach_each_level': cfg.MODEL.BOUNDARY_HEAD.DETACH_EACH_LEVEL,
             'num_layer_per_level': cfg.MODEL.BOUNDARY_HEAD.NUM_LAYER_PER_LEVEL,
             'gan_loss': cfg.MODEL.BOUNDARY_HEAD.GAN_LOSS,
+            'gan': PolyContrastiveLoss(cfg) if cfg.MODEL.BOUNDARY_HEAD.GAN_LOSS else None,
+            'is_additional_level': cfg.MODEL.BOUNDARY_HEAD.ADDITIONAL_LEVEL,
+            'detach_additional_level': cfg.MODEL.BOUNDARY_HEAD.DETACH_ADDITIONAL_LEVEL,
         }
 
         ret.update(
@@ -314,11 +322,12 @@ class BoundaryFormerPolygonHead(nn.Module):
 
         memory = src_flatten + lvl_pos_embed_flatten
         hs, inter_references = self.decoder(
-            tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, cls_token=cls_token, reference_boxes=box_preds_xyxy, is_residual=self.is_decoder_residual, detach_each_level=self.detach_each_level)
+            tgt, reference_points, memory, spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, cls_token=cls_token, reference_boxes=box_preds_xyxy, is_residual=self.is_decoder_residual, detach_each_level=self.detach_each_level, detach_additional_level=self.detach_additional_level)
 
         outputs_coords = []
         for lvl in range(len(hs)):
-            xy = self.xy_embed[lvl](hs[lvl])
+            idx_mlp = min(lvl, len(self.xy_embed)-1)
+            xy = self.xy_embed[idx_mlp](hs[lvl])
 
             if self.predict_in_box_space:
                 outputs_coord = (inverse_sigmoid(inter_references[lvl]) + xy).sigmoid()
@@ -332,6 +341,10 @@ class BoundaryFormerPolygonHead(nn.Module):
         for i in range(len(outputs_coords)):
             output_coords = outputs_coords[i]
             outputs_coords[i] = torch.cat([output_coords[j, :number_instances[j]] for j in range(batch_size)])
+
+        if self.is_additional_level:
+            additional_output_coords = outputs_coords[-1]
+            outputs_coords = outputs_coords[:-1]
 
         if self.training:
             vertex_losses = {}
@@ -355,6 +368,7 @@ class BoundaryFormerPolygonHead(nn.Module):
             }
 
             if self.gan:
+                output_coords = additional_output_coords if self.is_additional_level else outputs_coords[-1]
                 gloss, dloss, _ = self.gan(outputs_coords[-1], instances)
                 ret_loss['loss_gan_g'] = gloss * self.gan_loss
                 ret_loss['loss_gan_d'] = dloss * self.gan_loss
@@ -386,14 +400,6 @@ def build_poly_losses(cfg, input_shape):
         losses.append(POLY_LOSS_REGISTRY.get(name)(cfg, input_shape))
 
     return losses
-
-
-from random import random
-from typing import List
-import numpy as np
-import math
-from detectron2.structures.masks import PolygonMasks
-import cv2
 
 
 class PolyDiscriminator(nn.Module):
@@ -447,18 +453,17 @@ class PolyDiscriminator(nn.Module):
 
 
 class PolyContrastiveLoss(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, cfg):
         super().__init__()
 
-        self.npts = input_dim
-        d_model = 256
+        self.g_loss_weight = cfg.MODEL.BOUNDARY_HEAD.GAN.G_LOSS_WEIGHT
+        self.d_loss_weight = cfg.MODEL.BOUNDARY_HEAD.GAN.D_LOSS_WEIGHT
+        self.npts = cfg.MODEL.BOUNDARY_HEAD.POLY_NUM_PTS
+        self.d_model = cfg.MODEL.BOUNDARY_HEAD.GAN.MODEL_DIM
+        self.n_layers = cfg.MODEL.BOUNDARY_HEAD.GAN.NUM_LAYERS
 
-        # self.mlp = MLP(self.npts*2, d_model, 1, 4)
-        # self.mlp_infer = MLP(self.npts*2, d_model, 1, 4)
-        # self.mlp_infer.requires_grad_(False)
-
-        self.model = PolyDiscriminator(d_model, max_len=self.npts)
-        self.model_infer = PolyDiscriminator(d_model, max_len=self.npts)
+        self.model = PolyDiscriminator(self.d_model, nlayers=self.n_layers, max_len=self.npts)
+        self.model_infer = PolyDiscriminator(self.d_model, nlayers=self.n_layers, max_len=self.npts)
         self.model_infer.requires_grad_(False)
 
     def forward(self, verts: torch.Tensor, targets: List[Instances]):
@@ -491,7 +496,13 @@ class PolyContrastiveLoss(nn.Module):
         return gloss, dloss, targets
 
     def align_poly_npts(self, poly: np.ndarray, npts: int):
-        # align length to npts
+        """Align length to npts. Using cv2.approxPolyDP to reduce number of points.
+        Args:
+            - poly: [src_npts*2]
+            - npts: target number of points
+        Returns:
+            - poly: [npts*2]
+        """
         if npts < len(poly)/2:
             cnt = poly.reshape([len(poly)//2, 1, 2])
             cnt_less = None
