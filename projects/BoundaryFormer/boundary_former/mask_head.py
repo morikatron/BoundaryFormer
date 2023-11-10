@@ -380,6 +380,8 @@ class BoundaryFormerPolygonHead(nn.Module):
             return ret_loss
 
         # always take the last layer's outputs for now.
+        if self.is_additional_level:
+            outputs_coords.append(additional_output_coords)
         pred_polys_per_image_per_layer = [layer_output.split(number_instances, dim=0) for layer_output in outputs_coords]
         pred_polys_per_layer_per_image = [list(a) for a in zip(*pred_polys_per_image_per_layer)]
         for pred_polys_per_layer, instance in zip(pred_polys_per_layer_per_image, instances):
