@@ -64,7 +64,16 @@ name = [
     'sen-13.yaml',  # (12) 64pts box_reg 10 beta 0.5
     'sen-14.yaml',  # (13) 64pts box_reg 100 beta 0.5
     'sen-15.yaml',  # (14) 64pts MPViT
-][-1]
+    'sen-16.yaml',  # (15) Mask RCNN
+    'sen-17.yaml',  # (16) 64pts poly_smooth_loss=10
+    'sen-18.yaml',  # (17) 64pts MaskRCNN pooler_size=32
+    'sen-19.yaml',  # (18) 64pts poly_smooth_loss=10 POLY_SMOOTH_LOSS_WEIGHT_POINTWISE 0x4, 0.5x4
+    'sen-20.yaml',  # (19) 64pts poly_smooth_loss=2 POLY_SMOOTH_LOSS_WEIGHT_TYPE='linear'
+    'sen-21.yaml',  # (20) 64pts poly_smooth_loss=1 POLY_SMOOTH_LOSS_WEIGHT_TYPE='linear'
+    'sen-22.yaml',  # (21) 64pts gan_loss=1 NOTE Invalid now
+    'sen-23.yaml',  # (22) 64pts gan_loss=1 with transformer discriminator
+    'sen-24.yaml',  # (23) 64pts gan_loss=1 with transformer discriminator, additional_level=True
+][23]
 
 # Setup
 cfg = get_cfg()
@@ -74,7 +83,7 @@ cfg.merge_from_file(output_folder + name + '/config.yaml')
 cfg.MODEL.WEIGHTS = output_folder + name + '/model_final.pth'
 cfg.MODEL.DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-# thr = 0.99
+# thr = 0.95
 # cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = thr
 # cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.  # default 0.05
 # cfg.MODEL.RPN.NMS_THRESH = 1
@@ -100,13 +109,17 @@ boxs_xywh[..., 3] -= boxs_xywh[..., 1]
 scores = result.get('scores').cpu().numpy()
 labels = result.get('pred_classes').cpu().numpy()
 
-final_polys = postproc_polys(boxs_xywh, result.get('pred_polys').cpu().numpy())  # [n_instances, n_points, 2]
+final_polys = None
 polys_lyrs = []
-i = 0
-while result.has(f'pred_polys_{i}'):
-    polys_lyrs.append(postproc_polys(boxs_xywh, result.get(f'pred_polys_{i}').cpu().numpy()))
-    i += 1
-# masks = result.get('pred_masks').cpu().numpy()
+if result.has('pred_polys'):
+    final_polys = postproc_polys(boxs_xywh, result.get('pred_polys').cpu().numpy())  # [n_instances, n_points, 2]
+    i = 0
+    while result.has(f'pred_polys_{i}'):
+        polys_lyrs.append(postproc_polys(boxs_xywh, result.get(f'pred_polys_{i}').cpu().numpy()))
+        i += 1
+
+masks = result.get('pred_masks').cpu().numpy()
+raw_masks = result.get('raw_masks').cpu().numpy() if result.has('raw_masks') else None
 
 proposal = result._proposal
 proposal_boxes: torch.Tensor = proposal.get('proposal_boxes').tensor
@@ -116,28 +129,48 @@ proposal_boxes = proposal_boxes.cpu().numpy()
 proposal_probs = proposal_probs.cpu().numpy()
 
 
-print(f'Detected {polys_lyrs[0].shape[0]} instances, from {len(proposal_probs)} proposals.')
+# print(f'Detected {polys_lyrs[0].shape[0]} instances, from {len(proposal_probs)} proposals.')
 
 
 # ############ Proposals
 
-res = img.copy() // 3
-for box, score in zip(proposal_boxes, proposal_probs):
-    # if not (0.9 < score < 1):
-    #     continue
-    if not contain_xy(box, 618, 165):
-        continue
-    if not in_xyxy(box, 519, 66, 745, 263):
-        continue
+# res = img.copy() // 3
+# for box, score in zip(proposal_boxes, proposal_probs):
+#     # if not (0.9 < score < 1):
+#     #     continue
+#     if not contain_xy(box, 618, 165):
+#         continue
+#     if not in_xyxy(box, 519, 66, 745, 263):
+#         continue
 
-    box = box.astype(int)
-    print(score, box)
-    color = rand_rgb(score)
+#     box = box.astype(int)
+#     print(score, box)
+#     color = rand_rgb(score)
 
-    cv2.rectangle(res, box[:2], box[2:], color, 1)
-cv2.imshow('proposal', res)
-cv2.waitKey()
+#     cv2.rectangle(res, box[:2], box[2:], color, 1)
+# cv2.imshow('proposal', res)
+# cv2.waitKey()
 
+
+# ############ Mask heat map
+
+# for rmask, mask, box, score in zip(raw_masks.squeeze(), masks.squeeze(), boxs_xywh, scores):
+#     rmask = (rmask * 255).astype(np.uint8)
+#     mask = (mask * 255).astype(np.uint8)
+#     x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+#     rmask = cv2.resize(rmask, [w, h])
+
+#     res = img.copy() // 3
+#     colormask = np.zeros_like(res)
+#     colormask[y: y+h, x: x+w, 0] = rmask
+#     colormask[y: y+h, x: x+w, 1] = rmask
+#     colormask[y: y+h, x: x+w, 2] = rmask
+#     color = rand_rgb(score)
+#     colormask = colormask/255. * color
+#     res += colormask.astype(np.uint8)//2
+#     cv2.imshow('rmask', res)
+#     # cv2.imshow('mask', mask)
+#     cv2.waitKey()
 
 # ############ For each instance
 
@@ -180,7 +213,7 @@ for lvl, polys_lyr in enumerate(polys_lyrs):
 
         # if not contain_xy(box, 618, 165):
         #     continue
-        print(f'#{i} score={score}')
+        # print(f'#{i} score={score}')
 
         color = rand_rgb(score)
 
